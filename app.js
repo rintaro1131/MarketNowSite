@@ -101,31 +101,51 @@
     };
   }
 
-  /** ▼ここを“必ず”既存の getSPX を丸ごと置換する */
+  /** GitHub Pages対応: FMP→/api（GH Pagesではスキップ）→プロキシ */
   async function getSPX() {
-    // 1) URLクエリに fmp=API_KEY があればFMPを優先（CORS OK / 準リアルタイム）
-    const key = new URLSearchParams(location.search).get('fmp');
-    if (key) {
+    const params = new URLSearchParams(location.search);
+    const fmpKey = params.get('fmp');
+    const onGitHubPages = /\.github\.io$/i.test(location.hostname);
+
+    // 1) FMP（キーがあれば最優先。CORS OK／準リアルタイム）
+    if (fmpKey) {
       try {
-        const j = await fetchJson(`https://financialmodelingprep.com/api/v3/quote/%5EGSPC?apikey=${encodeURIComponent(key)}`);
+        const j = await fetchJson(`https://financialmodelingprep.com/api/v3/quote/%5EGSPC?apikey=${encodeURIComponent(fmpKey)}`);
         if (Array.isArray(j) && j[0] && Number.isFinite(+j[0].price)) {
+          console.info('[SPX] via FMP');
           return { value: +j[0].price, label: 'Live-ish (FMP)', source: 'fmp' };
         }
       } catch (e) {
-        console.warn('FMP失敗、Stooqへフォールバックします', e);
+        console.warn('[SPX] FMP failed, will fallback', e);
       }
     }
 
-    // 2) キーなし/失敗時 → CORS可の読み取りプロキシ経由で Stooq CSV を取得
-    //    例: https://r.jina.ai/http://stooq.com/q/d/l/?s=%5Espx&i=d
-    //    CSV フォーマット: date,open,high,low,close,volume
-    const csvUrl = 'https://r.jina.ai/http://stooq.com/q/d/l/?s=%5Espx&i=d';
-    const csv = await fetchText(csvUrl);
-    const lines = csv.trim().split('\n');
-    const last = lines[lines.length - 1].split(',');
-    const close = Number(last[4]);
-    if (!Number.isFinite(close)) throw new Error('Invalid Stooq CSV via proxy');
-    return { value: close, date: last[0], label: 'EOD (Stooq via proxy)', source: 'stooq-proxy' };
+    // 2) /api/spx （GitHub Pages では存在しないので試行自体をスキップ）
+    if (!onGitHubPages) {
+      try {
+        const data = await fetchJson('/api/spx'); // Vercel Edge 関数想定
+        if (data && Number.isFinite(+data.value)) {
+          console.info('[SPX] via /api/spx');
+          return { value: +data.value, date: data.date, label: 'EOD (Stooq via /api)', source: 'stooq-api' };
+        }
+      } catch (e) {
+        console.warn('[SPX] /api/spx failed, will fallback', e);
+      }
+    }
+
+    // 3) 最終フォールバック：CORS可の読み取りプロキシ経由で Stooq CSV
+    //    CSV: date,open,high,low,close,volume
+    try {
+      const csv = await fetchText('https://r.jina.ai/http://stooq.com/q/d/l/?s=%5Espx&i=d');
+      const last = csv.trim().split('\n').pop().split(',');
+      const close = Number(last[4]);
+      if (!Number.isFinite(close)) throw new Error('Invalid Stooq CSV via proxy');
+      console.info('[SPX] via Stooq proxy');
+      return { value: close, date: last[0], label: 'EOD (Stooq via proxy)', source: 'stooq-proxy' };
+    } catch (e) {
+      console.error('[SPX] proxy fallback failed', e);
+      throw e; // 呼び出し側の stale 表示ロジックに委ねる
+    }
   }
 
   // ---------- State ----------
