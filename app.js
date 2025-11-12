@@ -9,17 +9,29 @@
   const fmtUSD = new Intl.NumberFormat('en-US', { style:'currency', currency:'USD', maximumFractionDigits:2 });
   const fmtPlain = new Intl.NumberFormat('en-US', { maximumFractionDigits:2 });
 
-  /* タイムアウト付きfetch（iOS安定：AbortController不使用） */
-  async function fetchWithTimeout(input, { timeout = 9000, as = "text", init = {} } = {}) {
-    const timeoutPromise = new Promise((_, rej) =>
-      setTimeout(() => rej(new Error(`Timeout ${timeout}ms: ${typeof input === 'string' ? input : ''}`)), timeout)
-    );
-    const res = await Promise.race([ fetch(input, { cache: 'no-store', redirect: 'follow', ...init }), timeoutPromise ]);
-    if (!res || !res.ok) throw new Error(`HTTP ${res?.status}: ${typeof input === 'string' ? input : ''}`);
-    return as === "json" ? res.json() : res.text();
+  /* ===== iOS安定のタイムアウト付きfetch（AbortController不使用） ===== */
+  async function fetchWithTimeout(input, { timeout=10000, as="text", init={} } = {}) {
+    const to = new Promise((_, rej)=>setTimeout(()=>rej(new Error(`Timeout ${timeout}ms`)), timeout));
+    const res = await Promise.race([ fetch(input, { cache:"no-store", redirect:"follow", ...init }), to ]);
+    if (!res || !res.ok) throw new Error(`HTTP ${res?.status||"?"} ${typeof input==="string"?input:""}`);
+    return as==="json" ? res.json() : res.text();
   }
-  async function fetchJson(url, timeout=9000) { return fetchWithTimeout(url, { timeout, as: "json" }); }
-  async function fetchText(url, timeout=9000) { return fetchWithTimeout(url, { timeout, as: "text" }); }
+  const fetchJson = (u,t)=>fetchWithTimeout(u,{timeout:t,as:"json"});
+  const fetchText = (u,t)=>fetchWithTimeout(u,{timeout:t,as:"text"});
+  const isGH = /\.github\.io$/i.test(location.hostname);
+
+  /* ===== 画面デバッグ（?debug=1 で原因メッセージを表示） ===== */
+  function debugLog(msg){
+    if (!new URLSearchParams(location.search).has("debug")) return;
+    let box=document.getElementById("debug-box");
+    if(!box){
+      box=document.createElement("pre");
+      box.id="debug-box";
+      box.style.cssText="position:fixed;left:8px;bottom:8px;right:8px;max-height:40%;overflow:auto;padding:8px;border-radius:8px;background:#111;color:#0f0;font:12px/1.4 ui-monospace,Menlo,monospace;z-index:9999;white-space:pre-wrap";
+      document.body.appendChild(box);
+    }
+    box.textContent += `${new Date().toISOString()}  ${msg}\n`;
+  }
 
   // GitHub Pages判定（/api は使えないのでスキップ）
   function onGitHubPagesHost() {
@@ -98,65 +110,68 @@
     };
   }
 
-  /* S&P500 取得：FMP → 自前キャッシュ → 複数プロキシ */
+  /* ===== S&P500 取得：FMP → 自前JSON → 複数プロキシ（必ずフォールバック） ===== */
   async function getSPX() {
     const params = new URLSearchParams(location.search);
-    const fmpKey = params.get('fmp');
+    const fmpKey = params.get("fmp");
 
-    // 1) FMP（任意・最優先）
+    // 1) FMP（任意）
     if (fmpKey) {
       try {
-        const j = await fetchJson(`https://financialmodelingprep.com/api/v3/quote/%5EGSPC?apikey=${encodeURIComponent(fmpKey)}`, 10000);
+        const j = await fetchJson(`https://financialmodelingprep.com/api/v3/quote/%5EGSPC?apikey=${encodeURIComponent(fmpKey)}`, 12000);
         if (Array.isArray(j) && j[0] && Number.isFinite(+j[0].price)) {
-          console.info('[SPX] via FMP');
-          return { value: +j[0].price, label: 'Live-ish (FMP)', source: 'fmp' };
+          debugLog("[SPX] via FMP");
+          return { value:+j[0].price, label:"Live-ish (FMP)", source:"fmp" };
         }
-      } catch(e){ console.warn('[SPX] FMP failed -> fallback', e); }
+      } catch(e){ debugLog("[SPX] FMP failed: "+e.message); }
     }
 
-    // 2) 自前キャッシュ（GitHub Pages でも確実 /data/spx.json）
+    // 2) 自前キャッシュ（必ず先に試す。valueが数値でない場合は次へ）
     try {
-      const c = await fetchJson('./data/spx.json?ts=' + Date.now(), 6000);
+      const c = await fetchJson("./data/spx.json?ts="+Date.now(), 8000);
       if (c && Number.isFinite(+c.value)) {
-        console.info('[SPX] via local cache JSON');
-        return { value: +c.value, date: c.date, label: 'EOD (cache)', source: 'cache' };
+        debugLog("[SPX] via local cache JSON: "+c.value);
+        return { value:+c.value, date:c.date, label:"EOD (cache)", source:"cache" };
+      } else {
+        debugLog("[SPX] cache json present but invalid value");
       }
-    } catch(e){ console.warn('[SPX] cache json failed -> fallback', e); }
+    } catch(e){ debugLog("[SPX] cache json failed: "+e.message); }
 
-    // 3) CORS可プロキシ（r.jina.ai）を複数試行（^ を二重エンコード %255E）
+    // 3) （GitHub Pages以外でのみ）/api/spx を試行
+    if (!isGH) {
+      try {
+        const d = await fetchJson("/api/spx", 8000);
+        if (d && Number.isFinite(+d.value)) {
+          debugLog("[SPX] via /api/spx");
+          return { value:+d.value, date:d.date, label:"EOD (Stooq via /api)", source:"stooq-api" };
+        }
+      } catch(e){ debugLog("[SPX] /api failed: "+e.message); }
+    }
+
+    // 4) CORS可プロキシ（複数URL・^ の二重エンコードも含む）
     const targets = [
-      'https://r.jina.ai/https://stooq.com/q/d/l/?s=%255Espx&i=d',
-      'https://r.jina.ai/http://stooq.com/q/d/l/?s=%255Espx&i=d',
-      'https://r.jina.ai/http://stooq.pl/q/d/l/?s=%255Espx&i=d',
-      'https://r.jina.ai/https://stooq.com/q/l/?s=%255Espx&i=',
-      'https://r.jina.ai/http://stooq.com/q/l/?s=%255Espx&i=',
-      'https://r.jina.ai/https://query1.finance.yahoo.com/v7/finance/quote?symbols=%255EGSPC'
+      "https://r.jina.ai/https://stooq.com/q/d/l/?s=%255Espx&i=d",
+      "https://r.jina.ai/http://stooq.com/q/d/l/?s=%255Espx&i=d",
+      "https://r.jina.ai/http://stooq.pl/q/d/l/?s=%255Espx&i=d",
+      "https://r.jina.ai/https://stooq.com/q/l/?s=%255Espx&i=",
+      "https://r.jina.ai/http://stooq.com/q/l/?s=%255Espx&i=",
+      "https://r.jina.ai/https://query1.finance.yahoo.com/v7/finance/quote?symbols=%255EGSPC"
     ];
     for (const url of targets) {
       try {
-        const txt = await fetchText(url, 10000);
-        const t = txt.trim();
+        const t = await fetchText(url, 12000);
         let val, date;
-        if (/^\d{4}-\d{2}-\d{2},/m.test(t)) {
-          const arr = t.split('\n').pop().split(',');
-          date = arr[0]; val = Number(arr[4]);
-        } else if (t.startsWith('^')) {
-          const arr = t.split('\n').pop().split(',');
-          val = Number(arr[1]);
-        } else if (t.includes('"regularMarketPrice"')) {
-          const j = JSON.parse(t);
-          const q = j?.quoteResponse?.result?.[0];
-          if (q && Number.isFinite(+q.regularMarketPrice)) {
-            val = +q.regularMarketPrice;
-          }
-        }
+        const s = t.trim();
+        if (/^\d{4}-\d{2}-\d{2},/m.test(s)) { const a=s.split("\n").pop().split(","); date=a[0]; val=+a[4]; }
+        else if (s.startsWith("^"))       { const a=s.split("\n").pop().split(","); val=+a[1]; }
+        else if (s.includes('"regularMarketPrice"')) { const j=JSON.parse(s); const q=j?.quoteResponse?.result?.[0]; if(q) val=+q.regularMarketPrice; }
         if (Number.isFinite(val)) {
-          console.info('[SPX] via proxy:', url);
-          return { value: val, date, label: 'EOD (proxy)', source: 'proxy' };
+          debugLog("[SPX] via proxy: "+url);
+          return { value:val, date, label:"EOD (proxy)", source:"proxy" };
+        } else {
+          debugLog("[SPX] parse failed: "+url.slice(0,80));
         }
-      } catch(e){
-        console.warn('[SPX] proxy failed -> next', url, e);
-      }
+      } catch(e){ debugLog("[SPX] proxy error: "+url.slice(0,80)+" :: "+e.message); }
     }
     throw new Error('All SPX sources failed');
   }
