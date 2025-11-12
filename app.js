@@ -9,17 +9,20 @@
   const fmtUSD = new Intl.NumberFormat('en-US', { style:'currency', currency:'USD', maximumFractionDigits:2 });
   const fmtPlain = new Intl.NumberFormat('en-US', { maximumFractionDigits:2 });
 
-  // タイムアウト付き fetch（AbortController 非使用・iOS安定）
-  async function fetchWithTimeout(input, { timeout = 8000, as = "text", init = {} } = {}) {
+  // タイムアウト付きfetch（iOS安定：AbortController不使用）
+  async function fetchWithTimeout(input, { timeout = 9000, as = "text", init = {} } = {}) {
     const timeoutPromise = new Promise((_, rej) =>
       setTimeout(() => rej(new Error(`Timeout ${timeout}ms: ${typeof input === 'string' ? input : ''}`)), timeout)
     );
-    const res = await Promise.race([ fetch(input, { cache: 'no-store', redirect: 'follow', ...init }), timeoutPromise ]);
+    const res = await Promise.race([
+      fetch(input, { cache: 'no-store', redirect: 'follow', ...init }),
+      timeoutPromise
+    ]);
     if (!res || !res.ok) throw new Error(`HTTP ${res?.status}: ${typeof input === 'string' ? input : ''}`);
     return as === "json" ? res.json() : res.text();
   }
-  async function fetchJson(url, timeout=8000)  { return fetchWithTimeout(url, { timeout, as: "json"  }); }
-  async function fetchText(url, timeout=8000)  { return fetchWithTimeout(url, { timeout, as: "text"  }); }
+  async function fetchJson(url, timeout=9000) { return fetchWithTimeout(url, { timeout, as: "json" }); }
+  async function fetchText(url, timeout=9000) { return fetchWithTimeout(url, { timeout, as: "text" }); }
 
   // GitHub Pages判定（/api は使えないのでスキップ）
   function onGitHubPagesHost() {
@@ -98,7 +101,7 @@
     };
   }
 
-  // S&P500 取得：FMP → 複数プロキシ（順次フォールバック）
+  // S&P500 取得：FMP → 自前キャッシュJSON → 複数プロキシ
   async function getSPX() {
     const params = new URLSearchParams(location.search);
     const fmpKey = params.get('fmp');
@@ -114,16 +117,14 @@
       } catch (e) { console.warn('[SPX] FMP failed -> fallback', e); }
     }
 
-    // 2) （GitHub Pages以外でのみ）/api/spx を試行
-    if (!onGitHubPagesHost()) {
-      try {
-        const data = await fetchJson('/api/spx', 7000);
-        if (data && Number.isFinite(+data.value)) {
-          console.info('[SPX] via /api/spx');
-          return { value: +data.value, date: data.date, label: 'EOD (Stooq via /api)', source: 'stooq-api' };
-        }
-      } catch (e) { console.warn('[SPX] /api/spx failed -> fallback', e); }
-    }
+    // 2) 自前キャッシュJSON（GitHub Pagesで配信想定）
+    try {
+      const data = await fetchJson('./data/spx.json', 7000);
+      if (data && Number.isFinite(+data.value)) {
+        console.info('[SPX] via cache JSON');
+        return { value: +data.value, date: data.date, label: 'EOD (Cache)', source: 'cache' };
+      }
+    } catch (e) { console.warn('[SPX] cache JSON failed -> fallback', e); }
 
     // 3) CORS可の読み取りプロキシ（r.jina.ai）を複数試行（iOS対策で二重エンコードも含む）
     const targets = [
