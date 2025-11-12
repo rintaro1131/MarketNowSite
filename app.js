@@ -119,21 +119,25 @@
     if (fmpKey) {
       try {
         const j = await fetchJson(`https://financialmodelingprep.com/api/v3/quote/%5EGSPC?apikey=${encodeURIComponent(fmpKey)}`, 12000);
-        if (Array.isArray(j) && j[0] && Number.isFinite(+j[0].price)) {
-          debugLog("[SPX] via FMP");
-          return { value:+j[0].price, label:"Live-ish (FMP)", source:"fmp" };
+        const val = Array.isArray(j) && j[0] ? +j[0].price : NaN;
+        if (Number.isFinite(val) && val > 0) {
+          debugLog(`[SPX] via FMP: ${val}`);
+          return { value: val, label:"Live-ish (FMP)", source:"fmp" };
+        } else {
+          debugLog(`[SPX] FMP invalid: ${JSON.stringify(j).slice(0,120)}...`);
         }
       } catch(e){ debugLog("[SPX] FMP failed: "+e.message); }
     }
 
     // 2) 自前キャッシュ（必ず先に試す。valueが数値でない場合は次へ）
     try {
-      const c = await fetchJson("./data/spx.json?ts="+Date.now(), 8000);
-      if (c && Number.isFinite(+c.value)) {
-        debugLog("[SPX] via local cache JSON: "+c.value);
-        return { value:+c.value, date:c.date, label:"EOD (cache)", source:"cache" };
+      const c = await fetchJson(rel("./data/spx.json")+"?ts="+Date.now(), 8000);
+      const val = +c?.value;
+      if (Number.isFinite(val) && val > 0) {
+        debugLog("[SPX] via local cache JSON: "+val);
+        return { value: val, date:c.date, label:"EOD (cache)", source:"cache" };
       } else {
-        debugLog("[SPX] cache json present but invalid value");
+        debugLog("[SPX] cache json present but invalid value (treat as miss)");
       }
     } catch(e){ debugLog("[SPX] cache json failed: "+e.message); }
 
@@ -141,9 +145,12 @@
     if (!isGH) {
       try {
         const d = await fetchJson("/api/spx", 8000);
-        if (d && Number.isFinite(+d.value)) {
-          debugLog("[SPX] via /api/spx");
-          return { value:+d.value, date:d.date, label:"EOD (Stooq via /api)", source:"stooq-api" };
+        const val = +d?.value;
+        if (Number.isFinite(val) && val > 0) {
+          debugLog("[SPX] via /api/spx: "+val);
+          return { value: val, date:d.date, label:"EOD (Stooq via /api)", source:"stooq-api" };
+        } else {
+          debugLog("[SPX] /api/spx invalid value");
         }
       } catch(e){ debugLog("[SPX] /api failed: "+e.message); }
     }
@@ -165,9 +172,9 @@
         if (/^\d{4}-\d{2}-\d{2},/m.test(s)) { const a=s.split("\n").pop().split(","); date=a[0]; val=+a[4]; }
         else if (s.startsWith("^"))       { const a=s.split("\n").pop().split(","); val=+a[1]; }
         else if (s.includes('"regularMarketPrice"')) { const j=JSON.parse(s); const q=j?.quoteResponse?.result?.[0]; if(q) val=+q.regularMarketPrice; }
-        if (Number.isFinite(val)) {
-          debugLog("[SPX] via proxy: "+url);
-          return { value:val, date, label:"EOD (proxy)", source:"proxy" };
+        if (Number.isFinite(val) && val > 0) {
+          debugLog("[SPX] via proxy: "+url+" -> "+val);
+          return { value: val, date, label:"EOD (proxy)", source:"proxy" };
         } else {
           debugLog("[SPX] parse failed: "+url.slice(0,80));
         }
