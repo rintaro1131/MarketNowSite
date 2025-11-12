@@ -9,24 +9,21 @@
   const fmtUSD = new Intl.NumberFormat('en-US', { style:'currency', currency:'USD', maximumFractionDigits:2 });
   const fmtPlain = new Intl.NumberFormat('en-US', { maximumFractionDigits:2 });
 
-  /** 既存の fetchJson / fetchText を丸ごと置換 */
-  async function fetchJson(url, timeout = 8000) {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeout);
-    try {
-      const r = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
-      if (!r.ok) throw new Error(`${url} ${r.status}`);
-      return await r.json();
-    } finally { clearTimeout(t); }
+  // タイムアウト付き fetch（AbortController 非使用・iOS安定）
+  async function fetchWithTimeout(input, { timeout = 8000, as = "text", init = {} } = {}) {
+    const timeoutPromise = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error(`Timeout ${timeout}ms: ${typeof input === 'string' ? input : ''}`)), timeout)
+    );
+    const res = await Promise.race([ fetch(input, { cache: 'no-store', redirect: 'follow', ...init }), timeoutPromise ]);
+    if (!res || !res.ok) throw new Error(`HTTP ${res?.status}: ${typeof input === 'string' ? input : ''}`);
+    return as === "json" ? res.json() : res.text();
   }
-  async function fetchText(url, timeout = 8000) {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeout);
-    try {
-      const r = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
-      if (!r.ok) throw new Error(`${url} ${r.status}`);
-      return await r.text();
-    } finally { clearTimeout(t); }
+  async function fetchJson(url, timeout=8000)  { return fetchWithTimeout(url, { timeout, as: "json"  }); }
+  async function fetchText(url, timeout=8000)  { return fetchWithTimeout(url, { timeout, as: "text"  }); }
+
+  // GitHub Pages判定（/api は使えないのでスキップ）
+  function onGitHubPagesHost() {
+    return /\.github\.io$/i.test(location.hostname);
   }
 
   function qs(sel) { return document.querySelector(sel); }
@@ -101,51 +98,66 @@
     };
   }
 
-  /** GitHub Pages対応: FMP→/api（GH Pagesではスキップ）→プロキシ */
+  // S&P500 取得：FMP → 複数プロキシ（順次フォールバック）
   async function getSPX() {
     const params = new URLSearchParams(location.search);
     const fmpKey = params.get('fmp');
-    const onGitHubPages = /\.github\.io$/i.test(location.hostname);
 
-    // 1) FMP（キーがあれば最優先。CORS OK／準リアルタイム）
+    // 1) FMP（任意・最優先）
     if (fmpKey) {
       try {
-        const j = await fetchJson(`https://financialmodelingprep.com/api/v3/quote/%5EGSPC?apikey=${encodeURIComponent(fmpKey)}`);
+        const j = await fetchJson(`https://financialmodelingprep.com/api/v3/quote/%5EGSPC?apikey=${encodeURIComponent(fmpKey)}`, 9000);
         if (Array.isArray(j) && j[0] && Number.isFinite(+j[0].price)) {
           console.info('[SPX] via FMP');
           return { value: +j[0].price, label: 'Live-ish (FMP)', source: 'fmp' };
         }
-      } catch (e) {
-        console.warn('[SPX] FMP failed, will fallback', e);
-      }
+      } catch (e) { console.warn('[SPX] FMP failed -> fallback', e); }
     }
 
-    // 2) /api/spx （GitHub Pages では存在しないので試行自体をスキップ）
-    if (!onGitHubPages) {
+    // 2) （GitHub Pages以外でのみ）/api/spx を試行
+    if (!onGitHubPagesHost()) {
       try {
-        const data = await fetchJson('/api/spx'); // Vercel Edge 関数想定
+        const data = await fetchJson('/api/spx', 7000);
         if (data && Number.isFinite(+data.value)) {
           console.info('[SPX] via /api/spx');
           return { value: +data.value, date: data.date, label: 'EOD (Stooq via /api)', source: 'stooq-api' };
         }
+      } catch (e) { console.warn('[SPX] /api/spx failed -> fallback', e); }
+    }
+
+    // 3) CORS可の読み取りプロキシ（r.jina.ai）を複数試行（iOS対策で二重エンコードも含む）
+    const targets = [
+      'https://r.jina.ai/http://stooq.com/q/d/l/?s=%255Espx&i=d',
+      'https://r.jina.ai/https://stooq.com/q/d/l/?s=%255Espx&i=d',
+      'https://r.jina.ai/http://stooq.pl/q/d/l/?s=%255Espx&i=d',
+      'https://r.jina.ai/http://stooq.com/q/l/?s=%255Espx&i=',
+      'https://r.jina.ai/https://stooq.com/q/l/?s=%255Espx&i='
+    ];
+
+    for (const url of targets) {
+      try {
+        const csv = await fetchText(url, 9000);
+        const text = csv.trim();
+        let value, date;
+        if (/^\d{4}-\d{2}-\d{2},/m.test(text)) {
+          const last = text.split('\n').pop().split(',');
+          date = last[0];
+          value = Number(last[4]);
+        } else {
+          const line = text.split('\n').pop().split(',');
+          value = Number(line[1]);
+          date  = undefined;
+        }
+        if (Number.isFinite(value)) {
+          console.info('[SPX] via proxy:', url);
+          return { value, date, label: 'EOD (Stooq via proxy)', source: 'stooq-proxy' };
+        }
       } catch (e) {
-        console.warn('[SPX] /api/spx failed, will fallback', e);
+        console.warn('[SPX] proxy failed -> try next', url, e);
       }
     }
 
-    // 3) 最終フォールバック：CORS可の読み取りプロキシ経由で Stooq CSV
-    //    CSV: date,open,high,low,close,volume
-    try {
-      const csv = await fetchText('https://r.jina.ai/http://stooq.com/q/d/l/?s=%5Espx&i=d');
-      const last = csv.trim().split('\n').pop().split(',');
-      const close = Number(last[4]);
-      if (!Number.isFinite(close)) throw new Error('Invalid Stooq CSV via proxy');
-      console.info('[SPX] via Stooq proxy');
-      return { value: close, date: last[0], label: 'EOD (Stooq via proxy)', source: 'stooq-proxy' };
-    } catch (e) {
-      console.error('[SPX] proxy fallback failed', e);
-      throw e; // 呼び出し側の stale 表示ロジックに委ねる
-    }
+    throw new Error('All SPX sources failed');
   }
 
   // ---------- State ----------
