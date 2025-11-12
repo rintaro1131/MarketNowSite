@@ -9,15 +9,12 @@
   const fmtUSD = new Intl.NumberFormat('en-US', { style:'currency', currency:'USD', maximumFractionDigits:2 });
   const fmtPlain = new Intl.NumberFormat('en-US', { maximumFractionDigits:2 });
 
-  // タイムアウト付きfetch（iOS安定：AbortController不使用）
+  /* タイムアウト付きfetch（iOS安定：AbortController不使用） */
   async function fetchWithTimeout(input, { timeout = 9000, as = "text", init = {} } = {}) {
     const timeoutPromise = new Promise((_, rej) =>
       setTimeout(() => rej(new Error(`Timeout ${timeout}ms: ${typeof input === 'string' ? input : ''}`)), timeout)
     );
-    const res = await Promise.race([
-      fetch(input, { cache: 'no-store', redirect: 'follow', ...init }),
-      timeoutPromise
-    ]);
+    const res = await Promise.race([ fetch(input, { cache: 'no-store', redirect: 'follow', ...init }), timeoutPromise ]);
     if (!res || !res.ok) throw new Error(`HTTP ${res?.status}: ${typeof input === 'string' ? input : ''}`);
     return as === "json" ? res.json() : res.text();
   }
@@ -101,7 +98,7 @@
     };
   }
 
-  // S&P500 取得：FMP → 自前キャッシュJSON → 複数プロキシ
+  /* S&P500 取得：FMP → 自前キャッシュ → 複数プロキシ */
   async function getSPX() {
     const params = new URLSearchParams(location.search);
     const fmpKey = params.get('fmp');
@@ -109,55 +106,58 @@
     // 1) FMP（任意・最優先）
     if (fmpKey) {
       try {
-        const j = await fetchJson(`https://financialmodelingprep.com/api/v3/quote/%5EGSPC?apikey=${encodeURIComponent(fmpKey)}`, 9000);
+        const j = await fetchJson(`https://financialmodelingprep.com/api/v3/quote/%5EGSPC?apikey=${encodeURIComponent(fmpKey)}`, 10000);
         if (Array.isArray(j) && j[0] && Number.isFinite(+j[0].price)) {
           console.info('[SPX] via FMP');
           return { value: +j[0].price, label: 'Live-ish (FMP)', source: 'fmp' };
         }
-      } catch (e) { console.warn('[SPX] FMP failed -> fallback', e); }
+      } catch(e){ console.warn('[SPX] FMP failed -> fallback', e); }
     }
 
-    // 2) 自前キャッシュJSON（GitHub Pagesで配信想定）
+    // 2) 自前キャッシュ（GitHub Pages でも確実 /data/spx.json）
     try {
-      const data = await fetchJson('./data/spx.json', 7000);
-      if (data && Number.isFinite(+data.value)) {
-        console.info('[SPX] via cache JSON');
-        return { value: +data.value, date: data.date, label: 'EOD (Cache)', source: 'cache' };
+      const c = await fetchJson('./data/spx.json?ts=' + Date.now(), 6000);
+      if (c && Number.isFinite(+c.value)) {
+        console.info('[SPX] via local cache JSON');
+        return { value: +c.value, date: c.date, label: 'EOD (cache)', source: 'cache' };
       }
-    } catch (e) { console.warn('[SPX] cache JSON failed -> fallback', e); }
+    } catch(e){ console.warn('[SPX] cache json failed -> fallback', e); }
 
-    // 3) CORS可の読み取りプロキシ（r.jina.ai）を複数試行（iOS対策で二重エンコードも含む）
+    // 3) CORS可プロキシ（r.jina.ai）を複数試行（^ を二重エンコード %255E）
     const targets = [
-      'https://r.jina.ai/http://stooq.com/q/d/l/?s=%255Espx&i=d',
       'https://r.jina.ai/https://stooq.com/q/d/l/?s=%255Espx&i=d',
+      'https://r.jina.ai/http://stooq.com/q/d/l/?s=%255Espx&i=d',
       'https://r.jina.ai/http://stooq.pl/q/d/l/?s=%255Espx&i=d',
+      'https://r.jina.ai/https://stooq.com/q/l/?s=%255Espx&i=',
       'https://r.jina.ai/http://stooq.com/q/l/?s=%255Espx&i=',
-      'https://r.jina.ai/https://stooq.com/q/l/?s=%255Espx&i='
+      'https://r.jina.ai/https://query1.finance.yahoo.com/v7/finance/quote?symbols=%255EGSPC'
     ];
-
     for (const url of targets) {
       try {
-        const csv = await fetchText(url, 9000);
-        const text = csv.trim();
-        let value, date;
-        if (/^\d{4}-\d{2}-\d{2},/m.test(text)) {
-          const last = text.split('\n').pop().split(',');
-          date = last[0];
-          value = Number(last[4]);
-        } else {
-          const line = text.split('\n').pop().split(',');
-          value = Number(line[1]);
-          date  = undefined;
+        const txt = await fetchText(url, 10000);
+        const t = txt.trim();
+        let val, date;
+        if (/^\d{4}-\d{2}-\d{2},/m.test(t)) {
+          const arr = t.split('\n').pop().split(',');
+          date = arr[0]; val = Number(arr[4]);
+        } else if (t.startsWith('^')) {
+          const arr = t.split('\n').pop().split(',');
+          val = Number(arr[1]);
+        } else if (t.includes('"regularMarketPrice"')) {
+          const j = JSON.parse(t);
+          const q = j?.quoteResponse?.result?.[0];
+          if (q && Number.isFinite(+q.regularMarketPrice)) {
+            val = +q.regularMarketPrice;
+          }
         }
-        if (Number.isFinite(value)) {
+        if (Number.isFinite(val)) {
           console.info('[SPX] via proxy:', url);
-          return { value, date, label: 'EOD (Stooq via proxy)', source: 'stooq-proxy' };
+          return { value: val, date, label: 'EOD (proxy)', source: 'proxy' };
         }
-      } catch (e) {
-        console.warn('[SPX] proxy failed -> try next', url, e);
+      } catch(e){
+        console.warn('[SPX] proxy failed -> next', url, e);
       }
     }
-
     throw new Error('All SPX sources failed');
   }
 
